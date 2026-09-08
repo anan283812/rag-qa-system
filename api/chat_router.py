@@ -13,6 +13,12 @@ from core.llm_client import llm_chat, llm_chat_stream, resolve_user_llm_config
 from core.logger import write_log
 from core.query_rewrite import rewrite_query
 from core.rag_engine import bm25_search, hybrid_search_with_rerank
+from core.ticket_engine import (
+    build_ticket_prompt,
+    extract_ticket_json,
+    normalize_ticket,
+    render_ticket_markdown,
+)
 
 router = APIRouter(prefix="", tags=["对话问答"])
 
@@ -356,3 +362,66 @@ def chat_stream(payload: ChatRequest, current: dict = Depends(require_auth)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class TicketRequest(BaseModel):
+    """工单生成请求：question 为故障描述（一般取会话最近一次用户提问）。"""
+    question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LENGTH)
+    session_id: str = Field("default", min_length=1, max_length=128)
+
+
+@router.post("/chat/ticket")
+def generate_ticket(payload: TicketRequest, current: dict = Depends(require_auth)):
+    """把故障描述结合知识库检索结果，生成结构化维修工单（AI 草稿）。"""
+    q = payload.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="请先描述故障")
+    require_session_access(payload.session_id, current)
+
+    cfg = get_config()
+    user_llm = _user_llm_config(current.get("username"))
+    kb_owner = None if current.get("role") == "admin" else current.get("username")
+    write_log(f"生成维修工单请求：{q}")
+
+    valid_context, source_info = _retrieve(
+        q,
+        cfg["top_k"],
+        None,
+        use_rerank=bool(cfg.get("rerank_enabled", False)),
+        owner=kb_owner,
+    )
+    labeled = _labeled_context(valid_context, source_info) if valid_context else ""
+    prompt = build_ticket_prompt(labeled, q)
+
+    ticket = None
+    raw = ""
+    for attempt in range(2):
+        try:
+            raw = llm_chat(prompt, 0.2 if attempt == 0 else 0.1, user_llm) or ""
+        except HTTPException as exc:
+            write_log(f"工单生成模型调用失败：{exc}")
+            if attempt == 0:
+                continue
+            raise HTTPException(status_code=500, detail=f"工单生成失败：{exc.detail}")
+        ticket = extract_ticket_json(raw)
+        if ticket is not None:
+            break
+        # 第一次解析失败：追加“只输出 JSON”约束再试一次
+        prompt = prompt + "\n请只输出 JSON 对象本身，不要任何其它文字、解释或代码块。"
+    if ticket is None:
+        raise HTTPException(status_code=502, detail="工单生成失败：模型输出无法解析，请重试")
+
+    ticket = normalize_ticket(ticket)
+    md = render_ticket_markdown(ticket)
+    save_chat_record(
+        payload.session_id, f"[生成维修工单] {q}", md, thinking="", owner=current.get("username")
+    )
+    write_log(f"维修工单生成成功：{q}")
+    return {
+        "question": q,
+        "ticket": ticket,
+        "answer": md,
+        "source_list": source_info,
+        "session_id": payload.session_id,
+        "found": bool(valid_context),
+    }

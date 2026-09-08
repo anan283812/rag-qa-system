@@ -23,6 +23,7 @@ let kgCache = {};
 let kgPromises = {};
 let kgCy = null;
 let currentKg = { entities: [], relations: [] };
+let lastUserQuestion = ""; // 最近一条用户提问（供“生成工单”按钮取故障描述）
 
 /* ============ 基础渲染 ============ */
 
@@ -292,6 +293,7 @@ function appendSourceChips(container, sources) {
 }
 
 function addMessage(role, text, sources, thinking) {
+    if (role === "user") lastUserQuestion = text;
     $("messages").querySelector(".welcome-state")?.remove();
     const box = document.createElement("div");
     box.className = "message " + role;
@@ -712,6 +714,52 @@ async function sendQuestion() {
     }
 }
 
+/* ============ 维修工单生成 ============ */
+
+async function generateTicket() {
+    if (busy) return;
+    const input = $("questionInput");
+    const desc = (input.value.trim() || lastUserQuestion || "").trim();
+    if (!desc) {
+        toast("请先在输入框描述故障，或先发起一次故障问答", "error");
+        return;
+    }
+    busy = true;
+    input.disabled = true;
+    $("sendBtn").disabled = true;
+    $("ticketBtn").disabled = true;
+    const statusEl = $("inputStatus");
+    if (statusEl) statusEl.textContent = "正在结合知识库生成维修工单…";
+    try {
+        const res = await fetch("/chat/ticket", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Auth-Token": getAuthToken(),
+            },
+            body: JSON.stringify({ question: desc, session_id: sessionId }),
+        });
+        if (res.status === 401) {
+            window.location.href = "/login";
+            return;
+        }
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) {
+            throw new Error((data && data.detail) || "工单生成失败");
+        }
+        addMessage("assistant", data.answer || "工单生成失败", data.source_list || []);
+    } catch (e) {
+        toast("工单生成失败：" + e.message, "error");
+    } finally {
+        busy = false;
+        input.disabled = false;
+        $("sendBtn").disabled = false;
+        $("ticketBtn").disabled = false;
+        if (statusEl) statusEl.textContent = "";
+        loadSessions();
+    }
+}
+
 function quickAsk(q) {
     const input = $("questionInput");
     input.value = q || "";
@@ -809,6 +857,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     $("exportBtn").addEventListener("click", exportSession);
     $("clearBtn").addEventListener("click", clearSession);
     $("sendBtn").addEventListener("click", sendQuestion);
+    $("ticketBtn").addEventListener("click", generateTicket);
     $("toggleReferencesBtn").addEventListener("click", openReferences);
     $("closeReferencesBtn").addEventListener("click", closeReferences);
     $("refTabRefs").addEventListener("click", () => showRefTab("refs"));
